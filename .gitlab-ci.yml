@@ -1,0 +1,152 @@
+image: docker:latest
+services:
+  - docker:dind
+stages:
+  - build
+  - test
+  - sonarqube
+  - deploy
+  - kubernetes
+variables: 
+  # 1) Name of directory where restore and build objects are stored.
+  OBJECTS_DIRECTORY: 'obj'
+  # 2) Name of directory used for keeping restored dependencies.
+  NUGET_PACKAGES_DIRECTORY: '.nuget'
+  # 3) A relative path to the source code from project repository root.
+  # NOTE: Please edit this path so it matches the structure of your project!
+  SOURCE_CODE_PATH: '*/*/'
+
+# ### Define global cache rule
+#
+# Before building the project, all dependencies (e.g. third-party NuGet packages)
+# must be restored. Jobs on GitLab.com's Shared Runners are executed on autoscaled machines.
+#
+# Each machine is used only once (for security reasons) and after that is removed.
+# This means that, before every job, a dependency restore must be performed
+# because restored dependencies are removed along with machines. Fortunately,
+# GitLab provides cache mechanism with the aim of keeping restored dependencies
+# for other jobs.
+#
+# This example shows how to configure cache to pass over restored
+# dependencies for re-use.
+#
+# With global cache rule, cached dependencies will be downloaded before every job
+# and then unpacked to the paths as specified below.
+include:
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+
+cache:
+  # Per-stage and per-branch caching.
+  key: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+  paths:
+    # Specify three paths that should be cached:
+    #
+    # 1) Main JSON file holding information about package dependency tree, packages versions,
+    # frameworks etc. It also holds information where to the dependencies were restored.
+    - '$SOURCE_CODE_PATH$OBJECTS_DIRECTORY/project.assets.json'
+    # 2) Other NuGet and MSBuild related files. Also needed.
+    - '$SOURCE_CODE_PATH$OBJECTS_DIRECTORY/*.csproj.nuget.*'
+    # 3) Path to the directory where restored dependencies are kept.
+    - '$NUGET_PACKAGES_DIRECTORY'
+  #
+  # 'pull-push' policy means that latest cache will be downloaded (if it exists)
+  # before executing the job, and a newer version will be uploaded afterwards.
+  # Such a setting saves time when there are no changes in referenced third-party
+  # packages.
+  #
+  # For example, if you run a pipeline with changes in your code,
+  # but with no changes within third-party packages which your project is using,
+  # then project restore will happen quickly as all required dependencies
+  # will already be there — unzipped from cache.
+
+  # 'pull-push' policy is the default cache policy, you do not have to specify it explicitly.
+  policy: pull-push
+
+# ### Restore project dependencies
+#
+# NuGet packages by default are restored to '.nuget/packages' directory
+# in the user's home directory. That directory is out of scope of GitLab caching.
+#
+# To get around this, a custom path can be specified using the '--packages <PATH>' option
+# for 'dotnet restore' command. In this example, a temporary directory is created
+# in the root of project repository, so its content can be cached.
+#
+# Learn more about GitLab cache: https://docs.gitlab.com/ee/ci/caching/index.html
+before_script:
+  - 'dotnet restore ContentService.sln --packages $NUGET_PACKAGES_DIRECTORY'
+
+build:
+  tags:
+    - CI
+  stage: build
+  script:
+    - 'dotnet build ContentService.sln --no-restore'
+
+test:
+  stage: test
+  # ### Run the tests
+  #
+  # You can either run tests for all test projects that are defined in your solution
+  # with 'dotnet test' or run tests only for specific project by specifying
+  # a relative path to the directory where it is located (e.g. 'dotnet test ./test/UnitTests').
+  #
+  # You may want to define separate testing jobs for different types of testing
+  # (e.g. integration tests, unit tests etc).
+  script:
+    - 'dotnet test ContentService.sln --no-restore'
+
+sonarqube:
+  image: mcr.microsoft.com/dotnet/core/sdk:latest
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+      - dotnet tool list --global | Select-String -Pattern 'dotnet-sonarscanner' | Out-Null
+      - if ($LASTEXITCODE -ne 0) { dotnet tool install --global dotnet-sonarscanner }
+      - $env:PATH += ";${HOME}/.dotnet/tools"
+      - dotnet sonarscanner begin -k:"contentservice" -d:sonar.token="sqp_b3b7b525a9d126c0f4d58ef0058f5f448840db18" -d:sonar.host.url="http://localhost:9000" 
+      - dotnet build
+      - dotnet sonarscanner end -d:sonar.token=\"sqp_b3b7b525a9d126c0f4d58ef0058f5f448840db18\" -d:sonar.login=admin -d:sonar.password=1234
+      - taskkill /IM "dotnet.exe" /F
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+docker-build:
+  stage: deploy
+  # Use the official docker image.
+  image: docker:latest
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  services:
+    - docker:dind
+  script:
+    - echo "starting deployment to docker"
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build -t "$CI_REGISTRY_IMAGE${tag}" .
+    - docker push "$CI_REGISTRY_IMAGE${tag}"
+    - echo "End CD"
+
+dependency_scan:
+  stage: test
+  script:
+    - docker run --rm -v ${PWD}/tmp:/root/.cache/ -v //var/run/docker.sock:/var/run/docker.sock  aquasec/trivy image "$CI_REGISTRY_IMAGE${tag}"
+
+kubernetes:
+   stage: kubernetes
+   allow_failure: true
+   script:
+    - kubectl apply -f ./contentredisdeployment.yml
+    - kubectl apply -f ./contentredisservice.yml
+    - kubectl apply -f ./deployment.yml
+    - kubectl apply -f ./service.yml
+    
+autoscaler:
+  stage: kubernetes
+  allow_failure: true
+  script:
+    - kubectl apply -f ./hpa.yml

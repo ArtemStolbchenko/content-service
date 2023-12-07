@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: contentredis-service
+spec:
+  selector:
+    matchLabels:
+      app: contentredis-service
+  template:
+    metadata:
+      labels:
+        app: contentredis-service
+    spec:
+      hostname: rediscontent
+      containers:
+        - name: contentredis-service
+          image: redis:latest
+          ports:
+            - containerPort: 6379
+      restartPolicy: Always
